@@ -25,11 +25,19 @@ import tempfile
 import threading
 
 import boto3
+from boto3.exceptions import Boto3Error
 import click
 
 MAX_ATTEMPTS = 10
 
 fileblock = threading.Lock()
+
+class GlacierUploadException(Boto3Error):
+    """
+    An upload exception that will contain the upload_id to allow users to resume the upload afterwards
+    """
+    def __init__(self, upload_id=None):
+        self.upload_id = upload_id
 
 
 def upload(vault_name, file_name, region, arc_desc, part_size, num_threads, upload_id):
@@ -72,7 +80,7 @@ def upload(vault_name, file_name, region, arc_desc, part_size, num_threads, uplo
         click.echo('Archive ID: %s' % response['archiveId'])
         click.echo('Done.')
         file_to_upload.close()
-        return
+        return response
 
     job_list = []
     list_of_checksums = []
@@ -138,16 +146,21 @@ def upload(vault_name, file_name, region, arc_desc, part_size, num_threads, uplo
             futures_list, return_when=concurrent.futures.FIRST_EXCEPTION)
         if len(not_done) > 0:
             # an exception occured
-            for future in not_done:
-                future.cancel()
-            for future in done:
-                e = future.exception()
-                if e is not None:
-                    click.echo('Exception occured: %r' % e)
-            click.echo('Upload not aborted. Upload id: %s' % upload_id)
-            click.echo('Exiting.')
-            file_to_upload.close()
-            sys.exit(1)
+            try:
+                for future in not_done:
+                    future.cancel()
+                for future in done:
+                    e = future.exception()
+                    if e is not None:
+                        click.echo('Exception occured: %r' % e)
+                        # raise an Exception with the upload id
+                        raise GlacierUploadException(upload_id)
+            finally:
+                # Make sure we close the file before raising the exception. Don't exit here to allow
+                # custom exception handling in the calling code
+                click.echo('Upload not aborted. Upload id: %s' % upload_id)
+                click.echo('Exiting.')
+                file_to_upload.close()
         else:
             # all threads completed without raising
             for future in done:
@@ -177,6 +190,7 @@ def upload(vault_name, file_name, region, arc_desc, part_size, num_threads, uplo
     click.echo('Archive ID: %s' % response['archiveId'])
     click.echo('Done.')
     file_to_upload.close()
+    return response
 
 @click.command()
 @click.option('-v', '--vault-name', required=True,
